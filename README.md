@@ -1,4 +1,4 @@
-# @streamcoreai/js-sdk
+# @streamcore/js-sdk
 
 Framework-agnostic TypeScript SDK for connecting to a [StreamCoreAI](https://github.com/streamcoreai/streamcore-server) server via WebRTC + WHIP.
 
