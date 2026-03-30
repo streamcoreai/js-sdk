@@ -56,6 +56,7 @@ Creates a new client instance.
 | `onTranscript`   | `(entry: TranscriptEntry, all: TranscriptEntry[]) => void` | Fired on new or updated transcript |
 | `onAudioLevel`   | `(level: number) => void`                              | Fired every animation frame with mic level (0–1) |
 | `onError`        | `(error: Error) => void`                               | Fired on connection or server errors |
+| `onTiming`       | `(event: TimingEvent) => void`                         | Fired with server-side pipeline timing info |
 
 ### Instance Methods
 
@@ -74,6 +75,8 @@ Creates a new client instance.
 | `transcript` | `TranscriptEntry[]`  | Full conversation history            |
 | `audioLevel` | `number`             | Current mic audio level (0–1)        |
 | `isMuted`    | `boolean`            | Whether the mic is muted             |
+| `localStream`| `MediaStream \| null` | Local microphone stream (after connect) |
+| `remoteStream`| `MediaStream \| null`| Remote agent audio stream (after connect) |
 
 ### Types
 
@@ -85,12 +88,17 @@ interface TranscriptEntry {
   text: string;
   partial?: boolean;
 }
+
+interface TimingEvent {
+  stage: string;
+  ms: number;
+}
 ```
 
 ## Building from Source
 
 ```bash
-cd sdk
+cd typescript-sdk
 npm install
 npm run build
 ```
