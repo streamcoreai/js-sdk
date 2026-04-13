@@ -25,7 +25,7 @@ const DEFAULT_AUDIO_CONSTRAINTS: MediaTrackConstraints = {
  * real-time audio-level metering.
  */
 export class StreamCoreAIClient {
-  private config: Required<StreamCoreAIConfig>;
+  private config: Required<Omit<StreamCoreAIConfig, "token" | "tokenUrl" | "apiKey">> & Pick<StreamCoreAIConfig, "token" | "tokenUrl" | "apiKey">;
   private events: StreamCoreAIEvents;
 
   private pc: RTCPeerConnection | null = null;
@@ -46,6 +46,9 @@ export class StreamCoreAIClient {
   constructor(config: StreamCoreAIConfig = {}, events: StreamCoreAIEvents = {}) {
     this.config = {
       whipUrl: config.whipUrl ?? DEFAULT_WHIP_URL,
+      token: config.token,
+      tokenUrl: config.tokenUrl,
+      apiKey: config.apiKey,
       iceServers: config.iceServers ?? DEFAULT_ICE_SERVERS,
       audioConstraints: config.audioConstraints ?? DEFAULT_AUDIO_CONSTRAINTS,
     };
@@ -157,10 +160,26 @@ export class StreamCoreAIClient {
         pc.addEventListener("icegatheringstatechange", onGatherChange);
       });
 
+      // Fetch a fresh token from the token endpoint if configured.
+      let token = this.config.token;
+      if (this.config.tokenUrl) {
+        const tokenHeaders: Record<string, string> = {};
+        if (this.config.apiKey) {
+          tokenHeaders["Authorization"] = `Bearer ${this.config.apiKey}`;
+        }
+        const tokenRes = await fetch(this.config.tokenUrl, { method: "POST", headers: tokenHeaders });
+        if (!tokenRes.ok) {
+          throw new Error(`Token request failed (${tokenRes.status})`);
+        }
+        const tokenData = await tokenRes.json();
+        token = tokenData.token;
+      }
+
       // WHIP exchange: POST offer SDP, receive answer SDP + session URL.
       const { answerSDP, sessionURL } = await whipOffer(
         this.config.whipUrl,
-        pc.localDescription!.sdp
+        pc.localDescription!.sdp,
+        token
       );
       this.sessionURL = sessionURL;
 
@@ -191,7 +210,7 @@ export class StreamCoreAIClient {
     this.audioCtx = null;
 
     // RFC 9725 §4.2: DELETE the WHIP session to free server resources.
-    whipDelete(this.sessionURL);
+    whipDelete(this.sessionURL, this.config.token);
     this.sessionURL = "";
 
     this.pc?.close();
@@ -284,6 +303,10 @@ export class StreamCoreAIClient {
       }
       case "timing": {
         this.events.onTiming?.({ stage: msg.stage, ms: msg.ms });
+        break;
+      }
+      case "state": {
+        this.events.onAgentStateChange?.(msg.state);
         break;
       }
     }

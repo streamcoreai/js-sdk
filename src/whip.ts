@@ -10,11 +10,17 @@ export interface WHIPResult {
  */
 export async function whipOffer(
   whipUrl: string,
-  offerSDP: string
+  offerSDP: string,
+  token?: string
 ): Promise<WHIPResult> {
+  const headers: Record<string, string> = { "Content-Type": "application/sdp" };
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+
   const res = await fetch(whipUrl, {
     method: "POST",
-    headers: { "Content-Type": "application/sdp" },
+    headers,
     body: offerSDP,
   });
 
@@ -38,10 +44,14 @@ export async function whipOffer(
  * Terminate a WHIP session per RFC 9725 §4.2:
  * Send HTTP DELETE to the WHIP session URL.
  */
-export async function whipDelete(sessionURL: string): Promise<void> {
+export async function whipDelete(sessionURL: string, token?: string): Promise<void> {
   if (!sessionURL) return;
   try {
-    await fetch(sessionURL, { method: "DELETE" });
+    const headers: Record<string, string> = {};
+    if (token) {
+      headers["Authorization"] = `Bearer ${token}`;
+    }
+    await fetch(sessionURL, { method: "DELETE", headers });
   } catch {
     // Best-effort teardown; connection may already be closed.
   }
