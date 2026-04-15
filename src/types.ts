@@ -26,20 +26,11 @@ export type DataChannelMessage =
   | { type: "state"; state: AgentState };
 
 export interface StreamCoreAIConfig {
-  /** WHIP endpoint URL. Defaults to "http://localhost:8080/whip" */
   whipUrl?: string;
-  /** JWT token for authenticating with the WHIP endpoint. */
   token?: string;
-  /**
-   * Token endpoint URL. If set, the client will POST to this URL to fetch
-   * a JWT before each WHIP connection. Overrides `token` when both are set.
-   */
   tokenUrl?: string;
-  /** API key sent as Bearer header when fetching from `tokenUrl`. */
   apiKey?: string;
-  /** ICE server configuration. Defaults to Google STUN server. */
   iceServers?: RTCIceServer[];
-  /** Audio constraints for getUserMedia. */
   audioConstraints?: MediaTrackConstraints;
 }
 

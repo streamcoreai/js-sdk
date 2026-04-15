@@ -15,15 +15,10 @@ const DEFAULT_AUDIO_CONSTRAINTS: MediaTrackConstraints = {
   echoCancellation: true,
   noiseSuppression: true,
   autoGainControl: true,
-};
+  voiceIsolation: true,
+  channelCount: 1,
+} as MediaTrackConstraints;
 
-/**
- * Framework-agnostic voice agent client.
- *
- * Manages a WebRTC peer connection with WHIP signaling, microphone capture,
- * remote audio playback, data-channel transcript/response events, and
- * real-time audio-level metering.
- */
 export class StreamCoreAIClient {
   private config: Required<Omit<StreamCoreAIConfig, "token" | "tokenUrl" | "apiKey">> & Pick<StreamCoreAIConfig, "token" | "tokenUrl" | "apiKey">;
   private events: StreamCoreAIEvents;
@@ -31,11 +26,13 @@ export class StreamCoreAIClient {
   private pc: RTCPeerConnection | null = null;
   private sessionURL = "";
   private stream: MediaStream | null = null;
+  private meterStream: MediaStream | null = null;
   private _remoteStream: MediaStream | null = null;
   private remoteAudio: HTMLAudioElement | null = null;
   private audioCtx: AudioContext | null = null;
   private analyser: AnalyserNode | null = null;
   private animFrame = 0;
+  private statsInterval: ReturnType<typeof setInterval> | null = null;
   private assistantBuf = "";
 
   private _status: ConnectionStatus = "idle";
@@ -54,8 +51,6 @@ export class StreamCoreAIClient {
     };
     this.events = events;
   }
-
-  // ── Public getters ──────────────────────────────────────────────────
 
   get status(): ConnectionStatus {
     return this._status;
@@ -81,8 +76,6 @@ export class StreamCoreAIClient {
     return this._remoteStream;
   }
 
-  // ── Public API ──────────────────────────────────────────────────────
-
   async connect(): Promise<void> {
     try {
       this.setStatus("connecting");
@@ -91,12 +84,10 @@ export class StreamCoreAIClient {
 
       const pc = new RTCPeerConnection({
         iceServers: this.config.iceServers,
+        bundlePolicy: "max-bundle",
       });
       this.pc = pc;
 
-      // Create a DataChannel for receiving events (transcript, response)
-      // from the server. Must be created before the offer so it is
-      // included in the SDP.
       const dc = pc.createDataChannel("events");
       dc.onmessage = (e) => {
         try {
@@ -107,20 +98,29 @@ export class StreamCoreAIClient {
         }
       };
 
-      // Store the remote audio element so it doesn't get GC'd.
       pc.ontrack = (e) => {
-        const remoteStream = e.streams[0] || new MediaStream([e.track]);
+        const remoteStream = new MediaStream([e.track]);
         this._remoteStream = remoteStream;
 
         const audioEl = new Audio();
         audioEl.srcObject = remoteStream;
         audioEl.autoplay = true;
+        audioEl.muted = false;
+        audioEl.volume = 1.0;
         this.remoteAudio = audioEl;
 
-        // Force play (handles browsers that gate autoplay)
-        audioEl.play().catch(() => {
-          // Will retry on next user interaction
-        });
+        const tryPlay = () => {
+          audioEl.play().catch(() => {
+            const resumeOnGesture = () => {
+              audioEl.play().catch(() => {});
+              document.removeEventListener("click", resumeOnGesture);
+              document.removeEventListener("touchstart", resumeOnGesture);
+            };
+            document.addEventListener("click", resumeOnGesture, { once: true });
+            document.addEventListener("touchstart", resumeOnGesture, { once: true });
+          });
+        };
+        tryPlay();
       };
 
       pc.onconnectionstatechange = () => {
@@ -133,7 +133,6 @@ export class StreamCoreAIClient {
         }
       };
 
-      // Must register onicecandidate so the browser drives ICE gathering.
       pc.onicecandidate = () => {};
 
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -144,26 +143,43 @@ export class StreamCoreAIClient {
       stream.getTracks().forEach((track) => pc.addTrack(track, stream));
       this.startAudioLevelMonitoring(stream);
 
-      // Create offer and gather all ICE candidates before sending.
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
 
-      // Wait for ICE gathering to complete so the offer contains all candidates.
       await new Promise<void>((resolve) => {
         if (pc.iceGatheringState === "complete") {
           resolve();
           return;
         }
+
+        let resolved = false;
+        const done = () => {
+          if (resolved) return;
+          resolved = true;
+          clearTimeout(timer);
+          pc.onicecandidate = null;
+          pc.removeEventListener("icegatheringstatechange", onGatherChange);
+          resolve();
+        };
+
+        pc.onicecandidate = (e) => {
+          if (e.candidate === null) done();
+        };
+
         const onGatherChange = () => {
-          if (pc.iceGatheringState === "complete") {
-            pc.removeEventListener("icegatheringstatechange", onGatherChange);
-            resolve();
-          }
+          if (pc.iceGatheringState === "complete") done();
         };
         pc.addEventListener("icegatheringstatechange", onGatherChange);
+
+        const timer = setTimeout(() => {
+          const sdp = pc.localDescription?.sdp ?? "";
+          if (!sdp.includes("a=candidate:")) {
+            console.warn("[streamcoreai-sdk] ICE gathering timed out with no candidates");
+          }
+          done();
+        }, 3000);
       });
 
-      // Fetch a fresh token from the token endpoint if configured.
       let token = this.config.token;
       if (this.config.tokenUrl) {
         const tokenHeaders: Record<string, string> = {};
@@ -178,7 +194,6 @@ export class StreamCoreAIClient {
         token = tokenData.token;
       }
 
-      // WHIP exchange: POST offer SDP, receive answer SDP + session URL.
       const { answerSDP, sessionURL } = await whipOffer(
         this.config.whipUrl,
         pc.localDescription!.sdp,
@@ -207,12 +222,14 @@ export class StreamCoreAIClient {
     if (this.remoteAudio) {
       this.remoteAudio.pause();
       this.remoteAudio.srcObject = null;
+      if (this.remoteAudio.parentElement) {
+        this.remoteAudio.remove();
+      }
       this.remoteAudio = null;
     }
     this.audioCtx?.close();
     this.audioCtx = null;
 
-    // RFC 9725 §4.2: DELETE the WHIP session to free server resources.
     whipDelete(this.sessionURL, this.config.token);
     this.sessionURL = "";
 
@@ -231,15 +248,12 @@ export class StreamCoreAIClient {
     }
   }
 
-  /** Register an event listener after construction. */
   on<K extends keyof StreamCoreAIEvents>(
     event: K,
     handler: StreamCoreAIEvents[K]
   ): void {
     this.events[event] = handler;
   }
-
-  // ── Internal helpers ────────────────────────────────────────────────
 
   private setStatus(status: ConnectionStatus): void {
     this._status = status;
@@ -316,9 +330,23 @@ export class StreamCoreAIClient {
   }
 
   private startAudioLevelMonitoring(stream: MediaStream): void {
-    const audioCtx = new AudioContext();
+    // Safari AEC breaks when mic streams are routed through AudioContext.
+    if (this.isSafari()) {
+      this.startStatsBasedAudioLevel();
+      return;
+    }
+
+    const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+    const audioCtx = new AudioCtx();
     this.audioCtx = audioCtx;
-    const source = audioCtx.createMediaStreamSource(stream);
+
+    if (audioCtx.state === "suspended") {
+      audioCtx.resume().catch(() => {});
+    }
+
+    const meterStream = stream.clone();
+    this.meterStream = meterStream;
+    const source = audioCtx.createMediaStreamSource(meterStream);
     const analyser = audioCtx.createAnalyser();
     analyser.fftSize = 256;
     source.connect(analyser);
@@ -340,10 +368,43 @@ export class StreamCoreAIClient {
     tick();
   }
 
+  private isSafari(): boolean {
+    if (typeof navigator === "undefined") return false;
+    const ua = navigator.userAgent;
+    return /Version\/.*Safari/.test(ua) && !/Chrome|Chromium|Edg|Firefox/.test(ua);
+  }
+
+  private startStatsBasedAudioLevel(): void {
+    this.statsInterval = setInterval(async () => {
+      if (!this.pc) return;
+      try {
+        const stats = await this.pc.getStats();
+        let found = false;
+        stats.forEach((report: any) => {
+          if (found) return;
+          if (report.type === "media-source" && report.kind === "audio" && typeof report.audioLevel === "number") {
+            this._audioLevel = report.audioLevel;
+            this.events.onAudioLevel?.(this._audioLevel);
+            found = true;
+          }
+        });
+      } catch {}
+
+    }, 100);
+  }
+
   private cleanupAudioLevel(): void {
     if (this.animFrame) {
       cancelAnimationFrame(this.animFrame);
       this.animFrame = 0;
+    }
+    if (this.statsInterval) {
+      clearInterval(this.statsInterval);
+      this.statsInterval = null;
+    }
+    if (this.meterStream) {
+      this.meterStream.getTracks().forEach((t) => t.stop());
+      this.meterStream = null;
     }
     this._audioLevel = 0;
     this.events.onAudioLevel?.(0);
