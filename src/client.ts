@@ -133,6 +133,9 @@ export class StreamCoreAIClient {
         }
       };
 
+      // Must register onicecandidate so the browser drives ICE gathering.
+      pc.onicecandidate = () => {};
+
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: this.config.audioConstraints,
       });
