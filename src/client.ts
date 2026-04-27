@@ -25,6 +25,14 @@ export class StreamCoreAIClient {
 
   private pc: RTCPeerConnection | null = null;
   private sessionURL = "";
+  /**
+   * Most recently used JWT (either the static `config.token` or one fetched
+   * from `config.tokenUrl` during `connect`). `disconnect` reuses this so
+   * the WHIP DELETE is properly authenticated; otherwise servers enforcing
+   * Bearer auth on `/whip` reject the teardown and skip server-side
+   * finalization (billing, transcript persistence, etc.).
+   */
+  private lastToken: string | undefined;
   private stream: MediaStream | null = null;
   private meterStream: MediaStream | null = null;
   private _remoteStream: MediaStream | null = null;
@@ -194,6 +202,9 @@ export class StreamCoreAIClient {
         token = tokenData.token;
       }
 
+      // Cache the token so `disconnect` can authenticate the WHIP DELETE.
+      this.lastToken = token;
+
       const { answerSDP, sessionURL } = await whipOffer(
         this.config.whipUrl,
         pc.localDescription!.sdp,
@@ -230,8 +241,27 @@ export class StreamCoreAIClient {
     this.audioCtx?.close();
     this.audioCtx = null;
 
-    whipDelete(this.sessionURL, this.config.token);
+    // Resolve the token used for the WHIP DELETE. Prefer the cached token
+    // captured during `connect` (which may have come from `tokenUrl`), fall
+    // back to the static `config.token`, and as a last resort re-fetch from
+    // `tokenUrl` so teardown still authenticates. Fire-and-forget.
+    const sessionURL = this.sessionURL;
+    const cached = this.lastToken;
+    const cfg = this.config;
+    void (async () => {
+      let token = cached || cfg.token;
+      if (!token && cfg.tokenUrl) {
+        try {
+          const headers: Record<string, string> = {};
+          if (cfg.apiKey) headers["Authorization"] = `Bearer ${cfg.apiKey}`;
+          const res = await fetch(cfg.tokenUrl, { method: "POST", headers });
+          if (res.ok) token = (await res.json()).token;
+        } catch {}
+      }
+      await whipDelete(sessionURL, token);
+    })();
     this.sessionURL = "";
+    this.lastToken = undefined;
 
     this.pc?.close();
     this.pc = null;
