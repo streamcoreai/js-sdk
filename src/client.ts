@@ -1,4 +1,5 @@
-import { whipOffer, whipDelete } from "./whip.js";
+import { whipOffer, whipDelete, whipRestartIce, WHIPRestartError } from "./whip.js";
+import { applyIceFragment, iceFragmentFromSdp } from "./icerestart.js";
 import type {
   ConnectionStatus,
   TranscriptEntry,
@@ -18,6 +19,13 @@ const DEFAULT_AUDIO_CONSTRAINTS: MediaTrackConstraints = {
   voiceIsolation: true,
   channelCount: 1,
 } as MediaTrackConstraints;
+const DEFAULT_RECONNECT_ATTEMPTS = 3;
+const DEFAULT_RECONNECT_DELAY_MS = 2000;
+const ICE_GATHERING_TIMEOUT_MS = 3000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 export class StreamCoreAIClient {
   private config: Required<Omit<StreamCoreAIConfig, "token" | "tokenUrl" | "apiKey">> & Pick<StreamCoreAIConfig, "token" | "tokenUrl" | "apiKey">;
@@ -33,6 +41,12 @@ export class StreamCoreAIClient {
    * finalization (billing, transcript persistence, etc.).
    */
   private lastToken: string | undefined;
+  /** ETag of the current ICE session, sent as `If-Match` on an ICE restart. */
+  private etag = "";
+  /** Set while an ICE restart sequence is running, so it is never doubled up. */
+  private reconnecting = false;
+  /** Bumped by disconnect() so an in-flight reconnect abandons itself. */
+  private generation = 0;
   private stream: MediaStream | null = null;
   private meterStream: MediaStream | null = null;
   private _remoteStream: MediaStream | null = null;
@@ -56,6 +70,8 @@ export class StreamCoreAIClient {
       apiKey: config.apiKey,
       iceServers: config.iceServers ?? DEFAULT_ICE_SERVERS,
       audioConstraints: config.audioConstraints ?? DEFAULT_AUDIO_CONSTRAINTS,
+      reconnectAttempts: config.reconnectAttempts ?? DEFAULT_RECONNECT_ATTEMPTS,
+      reconnectDelayMs: config.reconnectDelayMs ?? DEFAULT_RECONNECT_DELAY_MS,
     };
     this.events = events;
   }
@@ -135,6 +151,13 @@ export class StreamCoreAIClient {
         const state = pc.connectionState;
         if (state === "connected") {
           this.setStatus("connected");
+        } else if (state === "disconnected") {
+          // Transient. ICE often repairs this on its own, so the restart
+          // sequence waits before spending an attempt — but if the local
+          // address changed it never will, and this is the only window in
+          // which a restart can still work: at ~25s the server sees `failed`,
+          // closes the peer, and the session becomes unrecoverable.
+          void this.reconnect();
         } else if (state === "failed" || state === "closed") {
           this.setStatus("disconnected");
           this.cleanupAudioLevel();
@@ -154,39 +177,7 @@ export class StreamCoreAIClient {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
 
-      await new Promise<void>((resolve) => {
-        if (pc.iceGatheringState === "complete") {
-          resolve();
-          return;
-        }
-
-        let resolved = false;
-        const done = () => {
-          if (resolved) return;
-          resolved = true;
-          clearTimeout(timer);
-          pc.onicecandidate = null;
-          pc.removeEventListener("icegatheringstatechange", onGatherChange);
-          resolve();
-        };
-
-        pc.onicecandidate = (e) => {
-          if (e.candidate === null) done();
-        };
-
-        const onGatherChange = () => {
-          if (pc.iceGatheringState === "complete") done();
-        };
-        pc.addEventListener("icegatheringstatechange", onGatherChange);
-
-        const timer = setTimeout(() => {
-          const sdp = pc.localDescription?.sdp ?? "";
-          if (!sdp.includes("a=candidate:")) {
-            console.warn("[streamcoreai-sdk] ICE gathering timed out with no candidates");
-          }
-          done();
-        }, 3000);
-      });
+      await this.waitForIceGathering(pc, true);
 
       let token = this.config.token;
       if (this.config.tokenUrl) {
@@ -205,12 +196,13 @@ export class StreamCoreAIClient {
       // Cache the token so `disconnect` can authenticate the WHIP DELETE.
       this.lastToken = token;
 
-      const { answerSDP, sessionURL } = await whipOffer(
+      const { answerSDP, sessionURL, etag } = await whipOffer(
         this.config.whipUrl,
         pc.localDescription!.sdp,
         token
       );
       this.sessionURL = sessionURL;
+      this.etag = etag;
 
       await pc.setRemoteDescription(
         new RTCSessionDescription({ type: "answer", sdp: answerSDP })
@@ -225,6 +217,9 @@ export class StreamCoreAIClient {
   }
 
   disconnect(): void {
+    // Abandons any in-flight ICE restart: it would otherwise PATCH a session
+    // this call is about to DELETE.
+    this.generation++;
     this.cleanupAudioLevel();
     this.stream?.getTracks().forEach((t) => t.stop());
     this.stream = null;
@@ -262,6 +257,7 @@ export class StreamCoreAIClient {
     })();
     this.sessionURL = "";
     this.lastToken = undefined;
+    this.etag = "";
 
     this.pc?.close();
     this.pc = null;
@@ -288,6 +284,150 @@ export class StreamCoreAIClient {
   private setStatus(status: ConnectionStatus): void {
     this._status = status;
     this.events.onStatusChange?.(status);
+  }
+
+  /**
+   * Recovers a dropped transport with an ICE restart, keeping the session — and
+   * therefore the conversation — alive on the server.
+   *
+   * Each attempt re-gathers candidates, PATCHes the resulting fragment to the
+   * session URL, and folds the server's reply back into the remote
+   * description. Between attempts it re-checks the connection state, because
+   * plain ICE frequently repairs the drop unaided and a restart would then be
+   * wasted work.
+   */
+  private async reconnect(): Promise<void> {
+    const maxAttempts = this.config.reconnectAttempts ?? DEFAULT_RECONNECT_ATTEMPTS;
+    if (this.reconnecting || maxAttempts <= 0) return;
+    if (!this.pc || !this.sessionURL) return;
+
+    this.reconnecting = true;
+    const generation = this.generation;
+    let delay = this.config.reconnectDelayMs ?? DEFAULT_RECONNECT_DELAY_MS;
+
+    try {
+      this.setStatus("reconnecting");
+
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        await sleep(delay);
+        delay *= 2;
+
+        // disconnect() was called, or the connection healed by itself while
+        // we waited — either way there is nothing left to restart.
+        if (generation !== this.generation) return;
+        const pc = this.pc;
+        if (!pc || pc.connectionState === "closed") return;
+        if (pc.connectionState === "connected") {
+          this.setStatus("connected");
+          this.events.onReconnect?.({ attempt, maxAttempts, outcome: "recovered" });
+          return;
+        }
+
+        this.events.onReconnect?.({ attempt, maxAttempts, outcome: "attempting" });
+
+        try {
+          await this.restartIce(pc);
+          // The restart is applied; ICE still has to complete its checks, so
+          // the move back to "connected" comes from onconnectionstatechange.
+          this.events.onReconnect?.({ attempt, maxAttempts, outcome: "recovered" });
+          return;
+        } catch (err) {
+          const terminal = err instanceof WHIPRestartError && !err.retryable;
+          if (terminal || attempt === maxAttempts) {
+            this.setStatus("disconnected");
+            this.cleanupAudioLevel();
+            this.events.onReconnect?.({
+              attempt,
+              maxAttempts,
+              outcome: "failed",
+              error: err instanceof Error ? err : new Error(String(err)),
+            });
+            return;
+          }
+          // A 412 means another restart landed first; adopt the ETag the
+          // server reported as current and try again against that generation.
+          if (err instanceof WHIPRestartError && err.currentEtag) {
+            this.etag = err.currentEtag;
+          }
+          console.warn(`[streamcoreai-sdk] ICE restart attempt ${attempt} failed:`, err);
+        }
+      }
+    } finally {
+      this.reconnecting = false;
+    }
+  }
+
+  /** One ICE restart round-trip against the existing peer connection. */
+  private async restartIce(pc: RTCPeerConnection): Promise<void> {
+    const offer = await pc.createOffer({ iceRestart: true });
+    await pc.setLocalDescription(offer);
+    await this.waitForIceGathering(pc, false);
+
+    const previousAnswer = pc.currentRemoteDescription?.sdp ?? pc.remoteDescription?.sdp;
+    if (!previousAnswer) {
+      throw new Error("no remote description to restart against");
+    }
+
+    const { fragment, etag } = await whipRestartIce(
+      this.sessionURL,
+      iceFragmentFromSdp(pc.localDescription?.sdp ?? offer.sdp ?? ""),
+      this.etag,
+      this.lastToken ?? this.config.token
+    );
+    this.etag = etag;
+
+    // The offer left us in have-local-offer; the connection only returns to
+    // stable once this answer is applied.
+    await pc.setRemoteDescription(
+      new RTCSessionDescription({
+        type: "answer",
+        sdp: applyIceFragment(previousAnswer, fragment),
+      })
+    );
+  }
+
+  /**
+   * Resolves when ICE gathering finishes or the timeout elapses.
+   *
+   * `allowComplete` must be false for a restart: gathering is already
+   * "complete" from the previous generation at the moment the restart offer is
+   * applied, so trusting that flag would send the server the old candidates.
+   * The end-of-candidates signal is per-generation and is the reliable one.
+   */
+  private waitForIceGathering(pc: RTCPeerConnection, allowComplete: boolean): Promise<void> {
+    return new Promise<void>((resolve) => {
+      if (allowComplete && pc.iceGatheringState === "complete") {
+        resolve();
+        return;
+      }
+
+      let resolved = false;
+      const done = () => {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(timer);
+        pc.onicecandidate = null;
+        pc.removeEventListener("icegatheringstatechange", onGatherChange);
+        resolve();
+      };
+
+      pc.onicecandidate = (e) => {
+        if (e.candidate === null) done();
+      };
+
+      const onGatherChange = () => {
+        if (pc.iceGatheringState === "complete") done();
+      };
+      pc.addEventListener("icegatheringstatechange", onGatherChange);
+
+      const timer = setTimeout(() => {
+        const sdp = pc.localDescription?.sdp ?? "";
+        if (!sdp.includes("a=candidate:")) {
+          console.warn("[streamcoreai-sdk] ICE gathering timed out with no candidates");
+        }
+        done();
+      }, ICE_GATHERING_TIMEOUT_MS);
+    });
   }
 
   private handleDataChannelMessage(msg: DataChannelMessage): void {
@@ -354,6 +494,15 @@ export class StreamCoreAIClient {
       }
       case "state": {
         this.events.onAgentStateChange?.(msg.state);
+        break;
+      }
+      case "connection": {
+        // The server noticed the drop first. Nothing to do — our own
+        // connectionstatechange drives the restart — but surfacing it lets a
+        // UI show "reconnecting…" a beat earlier.
+        if (msg.state === "reconnecting" && this._status === "connected") {
+          this.setStatus("reconnecting");
+        }
         break;
       }
     }
