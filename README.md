@@ -53,6 +53,10 @@ Creates a new client instance.
 | `apiKey`           | `string`               | —                                    | Sent as `Authorization: Bearer` when calling `tokenUrl` |
 | `iceServers`       | `RTCIceServer[]`       | `[{ urls: "stun:stun.l.google.com:19302" }]` | ICE server configuration |
 | `audioConstraints` | `MediaTrackConstraints`| `{ echoCancellation: true, noiseSuppression: true, autoGainControl: true, voiceIsolation: true, channelCount: 1 }` | Microphone constraints |
+| `reconnectAttempts`| `number`               | `3`                                  | ICE restarts to attempt while the connection is `disconnected`. `0` disables the phase. See [Reconnection](#reconnection) |
+| `reconnectDelayMs` | `number`               | `2000`                               | Wait before the first ICE restart, doubling each retry |
+| `resumeAttempts`   | `number`               | `2`                                  | Resume redials to attempt once the connection has `failed`. `0` disables the phase |
+| `resumeDelayMs`    | `number`               | `1000`                               | Wait before the first redial, doubling each retry |
 
 #### `StreamCoreAIEvents`
 
@@ -64,6 +68,7 @@ Creates a new client instance.
 | `onAgentStateChange` | `(state: AgentState) => void`                          | Fired when the agent starts listening, thinking, or speaking |
 | `onError`            | `(error: Error) => void`                               | Fired on connection or server errors |
 | `onTiming`           | `(event: TimingEvent) => void`                         | Fired with server-side pipeline timing info |
+| `onReconnect`        | `(info: ReconnectEvent) => void`                       | Fired per recovery attempt and once on the outcome. Watch for `recovered-without-history` |
 
 ### Instance Methods
 
@@ -78,7 +83,7 @@ Creates a new client instance.
 
 | Property     | Type                 | Description                          |
 | ------------ | -------------------- | ------------------------------------ |
-| `status`     | `ConnectionStatus`   | `"idle" \| "connecting" \| "connected" \| "error" \| "disconnected"` |
+| `status`     | `ConnectionStatus`   | `"idle" \| "connecting" \| "connected" \| "reconnecting" \| "error" \| "disconnected"` |
 | `transcript` | `TranscriptEntry[]`  | Full conversation history            |
 | `audioLevel` | `number`             | Current mic audio level (0–1)        |
 | `isMuted`    | `boolean`            | Whether the mic is muted             |
@@ -88,9 +93,30 @@ Creates a new client instance.
 ### Types
 
 ```ts
-type ConnectionStatus = "idle" | "connecting" | "connected" | "error" | "disconnected";
+type ConnectionStatus =
+  | "idle"
+  | "connecting"
+  | "connected"
+  // The transport dropped and recovery is in flight. Not terminal — the
+  // session, and with it the conversation, is still alive on the server.
+  | "reconnecting"
+  | "error"
+  | "disconnected";
 
 type AgentState = "listening" | "thinking" | "speaking";
+
+// Which mechanism a recovery attempt used. See Reconnection below.
+type ReconnectPhase = "ice-restart" | "resume";
+
+interface ReconnectEvent {
+  attempt: number;      // 1-based, counted within the phase
+  maxAttempts: number;
+  phase: ReconnectPhase;
+  // "recovered-without-history" means the call works but the agent has
+  // forgotten the conversation — worth surfacing, not just logging.
+  outcome: "attempting" | "recovered" | "recovered-without-history" | "failed";
+  error?: Error;
+}
 
 interface TranscriptEntry {
   role: "user" | "assistant";
@@ -108,35 +134,80 @@ type DataChannelMessage =
   | { type: "response"; text: string }
   | { type: "error"; message: string }
   | { type: "timing"; stage: string; ms: number }
-  | { type: "state"; state: AgentState };
+  | { type: "state"; state: AgentState }
+  | { type: "connection"; state: "reconnecting" | "connected" };
 ```
 
 ### Reconnection
 
-A network change mid-call — Wi-Fi to cellular, a VPN toggle, a laptop moving networks — kills the transport without ending the call. The SDK recovers it with an ICE restart, which keeps the *same* server session: the conversation history, the rolling summary, and the agent's state all survive, and there is no repeated greeting. This is automatic; nothing is required of your app.
+A network change mid-call — Wi-Fi to cellular, a VPN toggle, a laptop moving
+networks, a phone asleep in a pocket — kills the transport without ending the
+call. The SDK recovers it automatically and the conversation survives: the
+agent still knows who you are and does not replay its greeting.
 
-Status goes `connected` → `reconnecting` → `connected`. Subscribe to `onReconnect` if you want per-attempt detail:
+Recovery runs as a **ladder of two phases**, because they are good at different
+things:
+
+| Phase | When | Cost |
+|-------|------|------|
+| **ICE restart** | While the connection is `disconnected` | Invisible. Same peer connection, same DTLS, same tracks — just new candidates. |
+| **Resume redial** | Once the connection has `failed` | A full renegotiation and a moment of silence, but the server reattaches you to the same conversation. |
+
+ICE restart is tried first because it costs nothing. It stops being possible
+the moment the connection reaches `failed` — the server has closed its peer by
+then — which is exactly where a backgrounded tab or a laptop that slept lands.
+That is what the resume phase is for.
+
+Status goes `connected` → `reconnecting` → `connected` throughout. Subscribe to
+`onReconnect` for per-attempt detail:
 
 ```ts
 const agent = new StreamCoreAIClient(
-  { whipUrl, reconnectAttempts: 3, reconnectDelayMs: 2000 },
+  {
+    whipUrl,
+    reconnectAttempts: 3,   // ICE restarts,  2s → 4s → 8s
+    reconnectDelayMs: 2000,
+    resumeAttempts: 2,      // then redials,  1s → 2s
+    resumeDelayMs: 1000,
+  },
   {
     onStatusChange: (s) => setBanner(s === "reconnecting" ? "Reconnecting…" : ""),
-    onReconnect: ({ attempt, maxAttempts, outcome }) => {
-      console.log(`ICE restart ${attempt}/${maxAttempts}: ${outcome}`);
+    onReconnect: ({ phase, attempt, maxAttempts, outcome }) => {
+      console.log(`${phase} ${attempt}/${maxAttempts}: ${outcome}`);
+      if (outcome === "recovered-without-history") {
+        toast("Reconnected, but I've lost track of our conversation.");
+      }
     },
   }
 );
 ```
 
+**Handle `recovered-without-history`.** It means the call is working but the
+server could not resume the session — usually because the client was away
+longer than `session_grace_ms` — so the agent has no memory of anything said
+before. Everything still functions, which is precisely why users will not
+notice until the agent asks a question it was already answered. Say so in the
+UI.
+
 Two details worth knowing:
 
-- **The first attempt is deliberately delayed** (`reconnectDelayMs`, default 2s). Most drops are brief packet loss that ICE repairs unaided, and patching immediately would spend a restart on a connection that was about to recover by itself.
-- **The whole sequence must finish within ~25 seconds.** That is how long WebRTC takes to escalate from `disconnected` to `failed`, at which point the server closes the peer and the session is gone for good. The defaults (3 attempts at 2s, 4s, 8s) fit inside that window — if you raise `reconnectAttempts`, keep the total under it, or the last attempts are wasted.
+- **The first ICE restart is deliberately delayed** (`reconnectDelayMs`,
+  default 2s). Most drops are brief packet loss that ICE repairs unaided, and
+  patching immediately would spend an attempt on a connection that was about to
+  recover by itself.
+- **Both phases share one deadline.** `disconnected` becomes `failed` after
+  roughly 25 seconds, and the server then holds the conversation for
+  `session_grace_ms` (30s by default). The defaults fit comfortably; if you
+  raise `reconnectAttempts`, you are spending budget the resume phase would
+  otherwise have.
 
-If every attempt fails, or the server reports the session is gone (404/409), the status becomes `disconnected` and recovery is up to your app: call `connect()` again for a fresh session.
+If every phase fails, or the session is gone (404/409), the status becomes
+`disconnected` and recovery is up to your app: call `connect()` again for a
+fresh conversation. Set `reconnectAttempts: 0` to skip ICE restart,
+`resumeAttempts: 0` to skip redials, or both to handle drops yourself.
 
-Set `reconnectAttempts: 0` to disable and handle drops yourself.
+The microphone stream is reused across a redial, so no second permission prompt
+and no device re-acquisition.
 
 ### Low-level helpers
 

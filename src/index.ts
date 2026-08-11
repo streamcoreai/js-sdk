@@ -12,6 +12,7 @@ export type {
   TranscriptEntry,
   TimingEvent,
   ReconnectEvent,
+  ReconnectPhase,
   DataChannelMessage,
   StreamCoreAIConfig,
   StreamCoreAIEvents,

@@ -5,19 +5,44 @@ export interface WHIPResult {
   sessionURL: string;
   /** ETag identifying the ICE session (RFC 9725 §4.3.1); needed to PATCH it. */
   etag: string;
+  /**
+   * Single-use credential for reattaching a later redial to this
+   * conversation. Empty when the server cannot resume — a realtime
+   * (speech-to-speech) session, whose history lives inside the provider.
+   */
+  resumeToken: string;
+  /**
+   * "new", "resumed", or "expired". Anything but "resumed" on a redial means
+   * the agent has no memory of the earlier conversation.
+   */
+  resumeStatus: string;
 }
 
+/**
+ * Opens a WHIP session (RFC 9725 §4.2).
+ *
+ * `resumeToken` is a StreamCore extension: it asks the server to reattach this
+ * new transport to the conversation a previous connection was having, rather
+ * than starting a fresh one. Check `resumeStatus` on the result — a token the
+ * server no longer recognises still yields a working call, but one whose agent
+ * remembers nothing.
+ */
 export async function whipOffer(
   whipUrl: string,
   offerSDP: string,
-  token?: string
+  token?: string,
+  resumeToken?: string
 ): Promise<WHIPResult> {
   const headers: Record<string, string> = { "Content-Type": "application/sdp" };
   if (token) {
     headers["Authorization"] = `Bearer ${token}`;
   }
 
-  const res = await fetch(whipUrl, {
+  const url = resumeToken
+    ? `${whipUrl}${whipUrl.includes("?") ? "&" : "?"}resume=${encodeURIComponent(resumeToken)}`
+    : whipUrl;
+
+  const res = await fetch(url, {
     method: "POST",
     headers,
     body: offerSDP,
@@ -35,7 +60,13 @@ export async function whipOffer(
     ? location
     : `${new URL(whipUrl).origin}${location}`;
 
-  return { answerSDP, sessionURL, etag: res.headers.get("ETag") ?? "" };
+  return {
+    answerSDP,
+    sessionURL,
+    etag: res.headers.get("ETag") ?? "",
+    resumeToken: res.headers.get("X-Resume-Token") ?? "",
+    resumeStatus: res.headers.get("X-Resume-Status") ?? "",
+  };
 }
 
 export interface WHIPRestartResult {
