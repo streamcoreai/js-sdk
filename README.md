@@ -252,6 +252,27 @@ const agent = new StreamCoreAIClient({
 
 During `connect()`, the SDK `POST`s to `tokenUrl` (sending `apiKey` as a bearer token if provided) and expects `{ "token": "..." }` back. If both `token` and `tokenUrl` are set, `tokenUrl` wins. The token is cached so `disconnect()` can authenticate the WHIP `DELETE`.
 
+### Caller identity
+
+If you use an external agent and want it to remember a user across separate calls, it needs to know who is calling. This SDK has no `resourceId` option, and that is deliberate — a browser asserting its own identity is a claim anyone can edit in devtools.
+
+Set it on the **server** that backs your `tokenUrl` instead. That endpoint already knows which user is signed in, and it holds the API key that StreamCore's `/token` requires:
+
+```ts
+// your backend, at POST /agent-token
+const res = await fetch("https://agent.example.com/token", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${process.env.STREAMCORE_API_KEY}`,
+  },
+  body: JSON.stringify({ resource_id: session.user.id }),
+});
+return Response.json(await res.json()); // { token } — hand it to the browser
+```
+
+StreamCore signs the identity into the token, then forwards it to your agent as `resource_id` on every turn. See [Protocol → Caller identity](../server/docs/protocol.md#caller-identity) and [Bring your own agent](../server/docs/bring-your-own-agent.md).
+
 ## Building from Source
 
 ```bash

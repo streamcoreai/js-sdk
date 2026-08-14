@@ -138,6 +138,27 @@ const agent = new StreamCoreAIClient({
 
 在 `connect()` 期间，SDK 会 `POST` 到 `tokenUrl`（若提供了 `apiKey` 则作为 bearer token 发送），并期望返回 `{ "token": "..." }`。如果同时设置了 `token` 和 `tokenUrl`，以 `tokenUrl` 为准。token 会被缓存，以便 `disconnect()` 能对 WHIP `DELETE` 完成鉴权。
 
+### 通话方身份
+
+如果你使用外部 agent，并希望它跨多次通话记住同一个用户，它就需要知道来的是谁。本 SDK 没有 `resourceId` 选项，这是刻意的——浏览器自报身份，等于任何人在 devtools 里改一行就能冒充别人。
+
+请改为在支撑 `tokenUrl` 的**服务端**设置。那个端点本来就知道当前登录的是哪个用户，而且它持有 StreamCore `/token` 所需的 API key：
+
+```ts
+// 你的后端，POST /agent-token
+const res = await fetch("https://agent.example.com/token", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${process.env.STREAMCORE_API_KEY}`,
+  },
+  body: JSON.stringify({ resource_id: session.user.id }),
+});
+return Response.json(await res.json()); // { token } —— 再交给浏览器
+```
+
+StreamCore 会把该身份签进 token，之后在每一轮对话中以 `resource_id` 转发给你的 agent。参见[协议 → 通话方身份](../server/docs/protocol.zh-CN.md#通话方身份)与[自带 agent](../server/docs/bring-your-own-agent.zh-CN.md)。
+
 ## 从源码构建
 
 ```bash
