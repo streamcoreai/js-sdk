@@ -69,6 +69,8 @@ Creates a new client instance.
 | `onError`            | `(error: Error) => void`                               | Fired on connection or server errors |
 | `onTiming`           | `(event: TimingEvent) => void`                         | Fired with server-side pipeline timing info |
 | `onReconnect`        | `(info: ReconnectEvent) => void`                       | Fired per recovery attempt and once on the outcome. Watch for `recovered-without-history` |
+| `onDataChannelMessage` | `(message: DataChannelMessage) => void`              | Fired for every raw data-channel message, before the typed callbacks |
+| `onData`             | `(topic: string, payload: Uint8Array) => void`         | Fire-and-forget server data packet, payload already base64-decoded (`car.command` carries drivetrain commands) |
 
 ### Instance Methods
 

@@ -64,6 +64,8 @@ agent.disconnect();
 | `onAgentStateChange` | `(state: AgentState) => void`                          | 智能体开始聆听、思考或说话时触发 |
 | `onError`            | `(error: Error) => void`                               | 连接或服务端错误时触发 |
 | `onTiming`           | `(event: TimingEvent) => void`                         | 携带服务端流水线耗时信息 |
+| `onDataChannelMessage` | `(message: DataChannelMessage) => void`              | 每条原始 DataChannel 消息都会触发，早于各类型化回调 |
+| `onData`             | `(topic: string, payload: Uint8Array) => void`         | 服务端下发的单向数据包，payload 已完成 base64 解码（`car.command` 承载传动指令） |
 
 ### 实例方法
 

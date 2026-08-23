@@ -29,6 +29,23 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Standard-alphabet base64, matching Go's base64.StdEncoding on the server.
+ * Falls back to Buffer where there is no atob, so the SDK still parses data
+ * packets under Node and React Native.
+ */
+function decodeBase64(input: string): Uint8Array {
+  if (typeof atob === "function") {
+    const binary = atob(input);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+  const buffer = (globalThis as { Buffer?: { from(s: string, e: string): Uint8Array } }).Buffer;
+  if (buffer) return new Uint8Array(buffer.from(input, "base64"));
+  throw new Error("no base64 decoder available");
+}
+
 export class StreamCoreAIClient {
   private config: Required<Omit<StreamCoreAIConfig, "token" | "tokenUrl" | "apiKey">> & Pick<StreamCoreAIConfig, "token" | "tokenUrl" | "apiKey">;
   private events: StreamCoreAIEvents;
@@ -618,6 +635,8 @@ export class StreamCoreAIClient {
   }
 
   private handleDataChannelMessage(msg: DataChannelMessage): void {
+    this.events.onDataChannelMessage?.(msg);
+
     switch (msg.type) {
       case "transcript": {
         if (msg.final) {
@@ -690,6 +709,18 @@ export class StreamCoreAIClient {
         if (msg.state === "reconnecting" && this._status === "connected") {
           this.setStatus("reconnecting");
         }
+        break;
+      }
+      case "data": {
+        if (!this.events.onData) break;
+        let payload: Uint8Array;
+        try {
+          payload = decodeBase64(msg.payload);
+        } catch {
+          console.error("[streamcoreai-sdk] bad base64 on topic", msg.topic);
+          break;
+        }
+        this.events.onData(msg.topic, payload);
         break;
       }
     }

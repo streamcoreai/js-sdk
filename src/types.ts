@@ -59,7 +59,14 @@ export type DataChannelMessage =
   | { type: "error"; message: string }
   | { type: "timing"; stage: string; ms: number }
   | { type: "state"; state: AgentState }
-  | { type: "connection"; state: "reconnecting" | "connected" };
+  | { type: "connection"; state: "reconnecting" | "connected" }
+  /**
+   * A topic-addressed packet the server routes straight through to the
+   * client, used by tools that act on the device rather than on the server —
+   * `car.*` drivetrain commands arrive this way. `payload` is base64-encoded
+   * JSON; `onData` hands it over already decoded.
+   */
+  | { type: "data"; topic: string; payload: string };
 
 export interface StreamCoreAIConfig {
   whipUrl?: string;
@@ -123,4 +130,16 @@ export interface StreamCoreAIEvents {
   onError?: (error: Error) => void;
   onTiming?: (event: TimingEvent) => void;
   onAgentStateChange?: (state: AgentState) => void;
+  /**
+   * A topic-addressed packet from a device-side tool, already base64-decoded.
+   * The server sends these fire-and-forget: nothing is waiting on a reply, and
+   * the model has already been told the action succeeded.
+   */
+  onData?: (topic: string, payload: Uint8Array) => void;
+  /**
+   * Every data-channel message, before the typed callbacks above see it.
+   * The escape hatch for talking to a server that knows a message type this
+   * SDK does not; the Go, Rust, and Python SDKs have carried one for a while.
+   */
+  onDataChannelMessage?: (message: DataChannelMessage) => void;
 }
