@@ -63,7 +63,7 @@ export type DataChannelMessage =
   /**
    * A topic-addressed packet the server routes straight through to the
    * client, used by tools that act on the device rather than on the server —
-   * `car.*` drivetrain commands arrive this way. `payload` is base64-encoded
+   * `movement.*` locomotion commands arrive this way. `payload` is base64-encoded
    * JSON; `onData` hands it over already decoded.
    */
   | { type: "data"; topic: string; payload: string };
